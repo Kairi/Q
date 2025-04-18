@@ -1,7 +1,6 @@
 package main
 
 import (
-    "bufio"
     "bytes"
     "encoding/json"
     "flag"
@@ -10,6 +9,7 @@ import (
     "net/http"
     "os"
     "strings"
+    "github.com/peterh/liner"
 )
 
 // Message represents a single message in the chat conversation
@@ -87,17 +87,48 @@ func main() {
         os.Exit(1)
     }
 
-    model := flag.String("model", "o4-mini", "model to use (e.g., gpt-4o-mini or gpt-4)")
-    flag.Parse()
+   model := flag.String("model", "o4-mini", "model to use (e.g., gpt-4o-mini or gpt-4)")
+   system := flag.String("system", "", "optional initial system prompt to set assistant context")
+   flag.Parse()
 
-    fmt.Println("ChatGPT CLI interactive chat. Type your message and press Enter. Type 'exit' or Ctrl+D to quit.")
-    reader := bufio.NewReader(os.Stdin)
-    var messages []Message
+   // ANSI color codes for richer prompts
+   const (
+       ansiReset  = "\033[0m"
+       ansiGreen  = "\033[32m"
+       ansiBlue   = "\033[34m"
+       ansiYellow = "\033[33m"
+   )
+   // Header
+   fmt.Printf("%sChatGPT CLI interactive chat (%s)%s\n", ansiYellow, *model, ansiReset)
+   var messages []Message
+   if *system != "" {
+       messages = append(messages, Message{Role: "system", Content: *system})
+       fmt.Printf("System prompt: %s\n\n", *system)
+       // send initial system prompt to get assistant's response
+       fmt.Println("ChatGPT is thinking...")
+       resp, err := sendChat(apiKey, messages, *model)
+       if err != nil {
+           fmt.Fprintf(os.Stderr, "Chat error: %v\n", err)
+       } else {
+           fmt.Printf("%s\U0001F916 ChatGPT:%s %s\n\n", ansiBlue, ansiReset, resp)
+           messages = append(messages, Message{Role: "assistant", Content: resp})
+       }
+   }
+   fmt.Println("Type your message and press Enter. Type 'exit' or Ctrl+D to quit.")
+   // initialize Emacs-style line editor
+   rl := liner.NewLiner()
+   defer rl.Close()
+   rl.SetCtrlCAborts(true)
 
     for {
-        fmt.Print("> ")
-        input, err := reader.ReadString('\n')
+        // prompt with non-deletable prefix "You: ", colored green
+        fmt.Print(ansiGreen)
+        input, err := rl.Prompt("You: ")
+        fmt.Print(ansiReset)
         if err != nil {
+            if err == liner.ErrPromptAborted {
+                continue
+            }
             if err == io.EOF {
                 fmt.Println("\nExiting.")
                 return
@@ -113,6 +144,7 @@ func main() {
             fmt.Println("Exiting.")
             return
         }
+        rl.AppendHistory(input)
 
         messages = append(messages, Message{Role: "user", Content: input})
         fmt.Println("ChatGPT is thinking...")
@@ -121,7 +153,8 @@ func main() {
             fmt.Fprintf(os.Stderr, "Chat error: %v\n", err)
             continue
         }
-        fmt.Printf("ChatGPT: %s\n\n", resp)
+        // display assistant response with colored label
+        fmt.Printf("%s\U0001F916 ChatGPT:%s %s\n\n", ansiBlue, ansiReset, resp)
         messages = append(messages, Message{Role: "assistant", Content: resp})
     }
 }
