@@ -12,12 +12,12 @@ import (
    "os"
    "strings"
   
-   "net/url"
+
 
    // external libraries
-   "golang.org/x/oauth2"
-   "golang.org/x/oauth2/google"
    "github.com/peterh/liner"
+   "github.com/google/generative-ai-go/genai"
+   "google.golang.org/api/option"
 )
 
 // Message represents a single message in the chat conversation
@@ -92,122 +92,79 @@ func isVertexModel(model string) bool {
 }
 
 // getReply dispatches the request to OpenAI or Vertex AI based on model prefix
-func getReply(apiKey string, messages []Message, model string) (string, error) {
+func getReply(messages []Message, model string) (string, error) {
    if isVertexModel(model) {
        return sendVertexChat(messages, model)
+   }
+   apiKey := os.Getenv("OPENAI_API_KEY")
+   if apiKey == "" {
+       return "", fmt.Errorf("OPENAI_API_KEY environment variable not set for OpenAI model")
    }
    return sendChat(apiKey, messages, model)
 }
 
-// sendVertexChat sends conversation history to Google Vertex AI (Gemini) and returns the assistant's reply
+// sendVertexChat sends conversation history to Google Gemini API and returns the assistant's reply
 func sendVertexChat(messages []Message, model string) (string, error) {
-   project := os.Getenv("GOOGLE_CLOUD_PROJECT")
-   if project == "" {
-       return "", fmt.Errorf("GOOGLE_CLOUD_PROJECT environment variable not set")
-   }
-   location := os.Getenv("VERTEX_LOCATION")
-   if location == "" {
-       location = "us-central1"
-   }
-   // determine endpoint version: preview models require v1beta1
-   version := "v1"
-   if strings.Contains(model, "preview") {
-       version = "v1beta1"
-   }
-   // build base endpoint URL
-   path := fmt.Sprintf("projects/%s/locations/%s/publishers/google/models/%s:generateMessage",
-       project, location, model)
-   baseURL := fmt.Sprintf("https://%s-aiplatform.googleapis.com/%s/%s",
-       location, version, path)
-   // choose auth: API key or OAuth2
-   var client *http.Client
-   endpoint := baseURL
-   if key := os.Getenv("VERTEX_API_KEY"); key != "" {
-       // use API key auth
-       endpoint = endpoint + "?key=" + url.QueryEscape(key)
-       client = http.DefaultClient
-   } else {
-       // use Application Default Credentials
-       ctx := context.Background()
-       creds, err := google.FindDefaultCredentials(ctx, "https://www.googleapis.com/auth/cloud-platform")
-       if err != nil {
-           return "", fmt.Errorf("failed to obtain default credentials: %w", err)
-       }
-       client = oauth2.NewClient(ctx, creds.TokenSource)
+   apiKey := os.Getenv("GEMINI_API_KEY")
+   if apiKey == "" {
+       return "", fmt.Errorf("GEMINI_API_KEY environment variable not set")
    }
 
-   // prepare request body
-   type vertexMsg struct {
-       Author  string `json:"author"`
-       Content string `json:"content"`
+   ctx := context.Background()
+   client, err := genai.NewClient(ctx, option.WithAPIKey(apiKey))
+   if err != nil {
+       return "", fmt.Errorf("failed to create Gemini client: %w", err)
    }
-   type instance struct {
-       Context  string      `json:"context,omitempty"`
-       Messages []vertexMsg `json:"messages"`
-   }
-   var inst instance
+   defer client.Close()
+
+   gm := client.GenerativeModel(model)
+   
+   var cs *genai.ChatSession
+   
+   // Handle system message if present
    if len(messages) > 0 && messages[0].Role == "system" {
-       inst.Context = messages[0].Content
-       for _, m := range messages[1:] {
-           if m.Role == "user" || m.Role == "assistant" {
-               inst.Messages = append(inst.Messages, vertexMsg{Author: m.Role, Content: m.Content})
-           }
+       cs = gm.StartChat()
+       _, err := cs.SendMessage(ctx, genai.Text(messages[0].Content))
+       if err != nil {
+           return "", fmt.Errorf("failed to send initial system message to Gemini: %w", err)
        }
+       messages = messages[1:] // Remove system message
    } else {
-       for _, m := range messages {
-           if m.Role == "user" || m.Role == "assistant" {
-               inst.Messages = append(inst.Messages, vertexMsg{Author: m.Role, Content: m.Content})
-           }
+       cs = gm.StartChat()
+   }
+
+   // Add previous messages to history
+   for _, msg := range messages[:len(messages)-1] { // All messages except the last one
+       var role string
+       if msg.Role == "user" {
+           role = "user"
+       } else if msg.Role == "assistant" {
+           role = "model"
+       } else {
+           continue // Skip unknown roles
        }
-   }
-   reqBody := struct {
-       Instances  []instance            `json:"instances"`
-       Parameters map[string]interface{} `json:"parameters,omitempty"`
-   }{
-       Instances: []instance{inst},
+       cs.History = append(cs.History, &genai.Content{
+           Role:  role,
+           Parts: []genai.Part{genai.Text(msg.Content)},
+       })
    }
 
-   bodyBytes, err := json.Marshal(reqBody)
+   // Send the last message
+   resp, err := cs.SendMessage(ctx, genai.Text(messages[len(messages)-1].Content))
    if err != nil {
-       return "", err
+       return "", fmt.Errorf("failed to send message to Gemini: %w", err)
    }
-   req, err := http.NewRequest("POST", endpoint, bytes.NewBuffer(bodyBytes))
-   if err != nil {
-       return "", err
-   }
-   req.Header.Set("Content-Type", "application/json")
 
-   resp, err := client.Do(req)
-   if err != nil {
-       return "", err
+   if len(resp.Candidates) == 0 || len(resp.Candidates[0].Content.Parts) == 0 {
+       return "", fmt.Errorf("no candidates in Gemini response")
    }
-   defer resp.Body.Close()
-   respData, _ := io.ReadAll(resp.Body)
-   if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-       return "", fmt.Errorf("Vertex API error: %s", string(respData))
-   }
-   var respBody struct {
-       Predictions []struct {
-           Candidates []vertexMsg `json:"candidates"`
-       } `json:"predictions"`
-   }
-   if err := json.Unmarshal(respData, &respBody); err != nil {
-       return "", err
-   }
-   if len(respBody.Predictions) == 0 || len(respBody.Predictions[0].Candidates) == 0 {
-       return "", fmt.Errorf("no candidates in response")
-   }
-   return respBody.Predictions[0].Candidates[0].Content, nil
+
+   return fmt.Sprintf("%v", resp.Candidates[0].Content.Parts[0]), nil
 }
 
 func main() {
-    apiKey := os.Getenv("OPENAI_API_KEY")
-    if apiKey == "" {
-        fmt.Fprintln(os.Stderr, "Error: OPENAI_API_KEY environment variable not set")
-        os.Exit(1)
-    }
 
-   model := flag.String("model", "o4-mini", "model to use (e.g., gpt-4o-mini, gpt-4, or Gemini model like gemini-pro-1.0)")
+   model := flag.String("model", "gemini-2.5-flash-lite", "model to use (e.g., gpt-4o-mini, gpt-4, or Gemini model like gemini-pro-1.0, gemini-2.5-flash-lite)")
    system := flag.String("system", "", "optional initial system prompt to set assistant context")
    flag.Parse()
 
@@ -226,7 +183,7 @@ func main() {
        fmt.Printf("System prompt: %s\n\n", *system)
        // send initial system prompt to get assistant's response
        fmt.Println("ChatGPT is thinking...")
-       resp, err := getReply(apiKey, messages, *model)
+       resp, err := getReply(messages, *model)
        if err != nil {
            fmt.Fprintf(os.Stderr, "Chat error: %v\n", err)
        } else {
@@ -234,41 +191,58 @@ func main() {
            messages = append(messages, Message{Role: "assistant", Content: resp})
        }
    }
-   fmt.Println("Type your message and press Enter. Type 'exit' or Ctrl+D to quit.")
+   fmt.Println("Type your message and press Ctrl+D to send. Type 'exit' to quit.")
    // initialize Emacs-style line editor
    rl := liner.NewLiner()
    defer rl.Close()
    rl.SetCtrlCAborts(true)
+   rl.SetMultiLineMode(true)
 
     for {
-        // prompt with non-deletable prefix "You: ", colored green
+        var inputBuilder strings.Builder
         fmt.Print(ansiGreen)
-        input, err := rl.Prompt("You: ")
-        fmt.Print(ansiReset)
-        if err != nil {
-            if err == liner.ErrPromptAborted {
-                continue
+        for {
+            line, err := rl.Prompt("You: ")
+            fmt.Print(ansiReset) // Reset color after prompt
+            if err != nil {
+                if err == liner.ErrPromptAborted {
+                    inputBuilder.Reset() // Clear buffer if prompt aborted
+                    break // Break inner loop to re-prompt
+                }
+                if err == io.EOF {
+                    // EOF means end of input, send the message
+                    if inputBuilder.Len() == 0 {
+                        fmt.Println("\nExiting.")
+                        return // Exit if EOF on empty input
+                    }
+                    break // Break inner loop to process accumulated input
+                }
+                fmt.Fprintf(os.Stderr, "Read error: %v\n", err)
+                inputBuilder.Reset() // Clear buffer on error
+                break // Break inner loop to re-prompt
             }
-            if err == io.EOF {
-                fmt.Println("\nExiting.")
+
+            if line == "exit" {
+                fmt.Println("Exiting.")
                 return
             }
-            fmt.Fprintf(os.Stderr, "Read error: %v\n", err)
-            continue
+
+            if inputBuilder.Len() > 0 {
+                inputBuilder.WriteString("\n") // Add newline for multi-line input
+            }
+            inputBuilder.WriteString(line)
         }
-        input = strings.TrimSpace(input)
+
+        input := strings.TrimSpace(inputBuilder.String())
         if input == "" {
             continue
         }
-        if input == "exit" {
-            fmt.Println("Exiting.")
-            return
-        }
+
         rl.AppendHistory(input)
 
         messages = append(messages, Message{Role: "user", Content: input})
         fmt.Println("ChatGPT is thinking...")
-        resp, err := getReply(apiKey, messages, *model)
+        resp, err := getReply(messages, *model)
         if err != nil {
             fmt.Fprintf(os.Stderr, "Chat error: %v\n", err)
             continue
