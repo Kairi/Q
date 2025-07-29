@@ -24,7 +24,8 @@ func sendChat(apiKey string, messages []Message, model string) (string, error) {
 		return "", err
 	}
 
-	req, err := http.NewRequest("POST", "https://api.openai.com/v1/chat/completions", bytes.NewBuffer(bodyBytes))
+	endpoints := DefaultAPIEndpoints()
+	req, err := http.NewRequest("POST", endpoints.OpenAI, bytes.NewBuffer(bodyBytes))
 	if err != nil {
 		return "", err
 	}
@@ -63,18 +64,18 @@ func getReply(messages []Message, model string) (string, error) {
 	if isVertexModel(model) {
 		return sendVertexChat(messages, model)
 	}
-	apiKey := os.Getenv("OPENAI_API_KEY")
+	apiKey := os.Getenv(EnvOpenAIKey)
 	if apiKey == "" {
-		return "", fmt.Errorf("OPENAI_API_KEY environment variable not set for OpenAI model")
+		return "", fmt.Errorf("%s environment variable not set for OpenAI model", EnvOpenAIKey)
 	}
 	return sendChat(apiKey, messages, model)
 }
 
 // sendVertexChat sends conversation history to Google Gemini API and returns the assistant's reply
 func sendVertexChat(messages []Message, model string) (string, error) {
-	apiKey := os.Getenv("GEMINI_API_KEY")
+	apiKey := os.Getenv(EnvGeminiKey)
 	if apiKey == "" {
-		return "", fmt.Errorf("GEMINI_API_KEY environment variable not set")
+		return "", fmt.Errorf("%s environment variable not set", EnvGeminiKey)
 	}
 
 	ctx := context.Background()

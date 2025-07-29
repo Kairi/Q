@@ -14,7 +14,7 @@ func getHistoryDir() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to get user config directory: %w", err)
 	}
-	historyDir := filepath.Join(configDir, "q", "history")
+	historyDir := filepath.Join(configDir, AppHistoryDir, "history")
 	if err := os.MkdirAll(historyDir, 0755); err != nil {
 		return "", fmt.Errorf("failed to create history directory: %w", err)
 	}
